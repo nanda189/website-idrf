@@ -1,0 +1,221 @@
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const session = require('express-session');
+const helmet = require('helmet');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const SALT_ROUNDS = 12;
+
+app.use(helmet());
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'change_this_secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    // secure: true, // enable when using HTTPS
+    maxAge: 1000 * 60 * 60 * 2 // 2 hours
+  }
+}));
+
+
+const db = new sqlite3.Database(path.join(__dirname, 'users.db'), (err) => {
+  if (err) return console.error('DB open error', err);
+  console.log('Connected to SQLite database.');
+});
+
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT (datetime('now','localtime'))
+  )
+`);
+
+
+app.use((req, res, next) => {
+  res.locals.user = req.session.user || null;
+  next();
+});
+
+
+function layout(title, body) {
+  return `<!doctype html>
+  <html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>${title}</title>
+    <style>
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;max-width:800px;margin:40px auto;padding:0 20px}
+      header{display:flex;justify-content:space-between;align-items:center}
+      form{max-width:420px}
+      input,button{display:block;width:100%;padding:10px;margin:8px 0}
+      .error{color:#b00020}
+      .notice{color:#006600}
+      nav a{margin-right:10px}
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>${title}</h1>
+      <nav>
+        ${resLink('/')}
+        ${resLink('/register','Register')}
+        ${resLink('/login','Login')}
+        ${resLink('/profile','Profile')}
+      </nav>
+    </header>
+    <main>
+      ${body}
+    </main>
+  </body>
+  </html>`;
+}
+
+function resLink(url, text) {
+  return `<a href="${url}">${text || url}</a>`;
+}
+
+app.get('/', (req, res) => {
+  if (req.session.user) {
+    res.send(layout('Home', `<p>Welcome back, <strong>${escapeHtml(req.session.user.username)}</strong>!</p>
+      <p><a href="/profile">Go to profile</a> or <a href="/logout">Logout</a></p>
+    `));
+  } else {
+    res.send(layout('Home', `<p>You are not logged in.</p>
+      <p><a href="/login">Login</a> or <a href="/register">Register</a></p>
+    `));
+  }
+});
+
+app.get('/register', (req, res) => {
+  res.send(layout('Register', `
+    <form method="POST" action="/register">
+      <label>Username</label>
+      <input name="username" required minlength="3" maxlength="32" />
+      <label>Email</label>
+      <input name="email" type="email" required />
+      <label>Password</label>
+      <input name="password" type="password" required minlength="6" />
+      <button type="submit">Register</button>
+    </form>
+  `));
+});
+
+app.post('/register', async (req, res) => {
+  try {
+    const username = (req.body.username || '').trim();
+    const email = (req.body.email || '').trim().toLowerCase();
+    const password = req.body.password || '';
+
+    if (!username || !email || !password) {
+      return res.send(layout('Register', `<p class="error">All fields are required.</p>`));
+    }
+    if (username.length < 3 || password.length < 6) {
+      return res.send(layout('Register', `<p class="error">Username or password too short.</p>`));
+    }
+
+    const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
+
+    const stmt = db.prepare('INSERT INTO users (username, email, password_hash) VALUES (?,?,?)');
+    stmt.run(username, email, password_hash, function(err) {
+      if (err) {
+        if (err.message && err.message.includes('UNIQUE')) {
+          return res.send(layout('Register', `<p class="error">Username or email already in use.</p>`));
+        }
+        console.error('DB insert error', err);
+        return res.send(layout('Register', `<p class="error">Server error.</p>`));
+      }
+      // auto-login after register
+      req.session.user = { id: this.lastID, username, email };
+      res.send(layout('Registered', `<p class="notice">Registration successful. Welcome, ${escapeHtml(username)}!</p>
+        <p><a href="/">Home</a> | <a href="/profile">Profile</a></p>
+      `));
+    });
+    stmt.finalize();
+  } catch (e) {
+    console.error(e);
+    res.send(layout('Register', `<p class="error">Server error.</p>`));
+  }
+});
+
+app.get('/login', (req, res) => {
+  res.send(layout('Login', `
+    <form method="POST" action="/login">
+      <label>Username or Email</label>
+      <input name="identifier" required />
+      <label>Password</label>
+      <input name="password" type="password" required />
+      <button type="submit">Login</button>
+    </form>
+  `));
+});
+
+app.post('/login', (req, res) => {
+  const identifier = (req.body.identifier || '').trim();
+  const password = req.body.password || '';
+  if (!identifier || !password) return res.send(layout('Login', `<p class="error">Missing credentials.</p>`));
+
+  // find by username or email
+  db.get('SELECT id, username, email, password_hash FROM users WHERE username = ? OR email = ?', [identifier, identifier.toLowerCase()], async (err, row) => {
+    if (err) {
+      console.error(err);
+      return res.send(layout('Login', `<p class="error">Server error.</p>`));
+    }
+    if (!row) return res.send(layout('Login', `<p class="error">Invalid username/email or password.</p>`));
+
+    const match = await bcrypt.compare(password, row.password_hash);
+    if (!match) return res.send(layout('Login', `<p class="error">Invalid username/email or password.</p>`));
+
+    // success
+    req.session.user = { id: row.id, username: row.username, email: row.email };
+    res.send(layout('Login success', `<p class="notice">Logged in as ${escapeHtml(row.username)}.</p>
+      <p><a href="/">Home</a> | <a href="/profile">Profile</a></p>
+    `));
+  });
+});
+
+app.get('/profile', (req, res) => {
+  if (!req.session.user) return res.redirect('/login');
+  const u = req.session.user;
+  res.send(layout('Profile', `
+    <h2>${escapeHtml(u.username)}</h2>
+    <p>Email: ${escapeHtml(u.email)}</p>
+    <p><a href="/logout">Logout</a></p>
+  `));
+});
+
+app.get('/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) console.error('Session destroy error', err);
+    res.clearCookie('connect.sid');
+    res.redirect('/');
+  });
+});
+
+// Utility: very small HTML escaper
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
